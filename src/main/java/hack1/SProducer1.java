@@ -11,7 +11,6 @@ import java.util.concurrent.TimeUnit;
 
 public class SProducer1 {
 
-    private final static String topic = "test2";
 
     public static void main(String[] args) throws Exception {
         insertRecords();
@@ -19,13 +18,15 @@ public class SProducer1 {
 
     private static void insertRecords() throws Exception {
         Producer<SRecord, String> producer = new KafkaProducer<>(initProps());
-        for (int i = 0; i < 100; i++) {
-            final int id = i % 10;
+        int counter = 0;
+        for (int i = 0; i < 10; i++) {
+            final int id = i % 2;
             Future<RecordMetadata> send =
-                    producer.send(new ProducerRecord<SRecord, String>(topic, null, new SRecord(id, "Hello").toString()));
+                    producer.send(new ProducerRecord<SRecord, String>(CommonConfiguration.topic, null, new SRecord(id, "Hello").toString()));
+            counter++;
             send.get(10000, TimeUnit.MILLISECONDS);
         }
-        System.out.println("Successfully sent");
+        System.out.println("Successfully sent " + counter + " records");
         producer.flush();
     }
 

@@ -5,9 +5,12 @@ import org.apache.kafka.common.TopicPartition;
 
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 public class SConsumer1 {
+    private static final Logger LOG = Logger.getLogger(SConsumer1.class.getName());
     public static void main(String[] args) {
         consumeRecords();
     }
@@ -18,37 +21,87 @@ public class SConsumer1 {
         final ConsumerRebalanceListener listener = new PartitionListener(consumer);
         consumer.subscribe(Arrays.asList(topic), listener);
         //consumer.subscribe(Arrays.asList(topic));
-
-
         int recordsCount = 0;
         // consume records
         while (true) {
             ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1_000));
+//            consumer.committed()
+            final Map<TopicPartition, OffsetAndMetadata> tpOffsetMd = new HashMap<>();
             for (TopicPartition tp: records.partitions()) {
                 List<ConsumerRecord<String, String>> perPartitionRecords = records.records(tp);
                 //re-create the record from values.
                 List<ConsumerRecord<String, SRecord>> perPartitionData = fromString(perPartitionRecords);
-
+                tpOffsetMd.put(tp, processPartitionRecords(perPartitionData));
+                recordsCount += perPartitionData.size();
             }
-            for (ConsumerRecord rec: records) {
-                System.out.printf("offset = %d, key = %s, value = %s\n", rec.offset(), rec.key(), rec.value());
-                // commit offset
-                recordsCount++;
-                /**
-                 * a map of topicPartition, and a ds for offset of all 'ids' in all the records for a partition
-                 * Given that there are a limited number of ids, a particular id is handled by a dedicated tp.
-                 * That map is populated in the listener#onAssign, and the revoked entries are flushed on onRevoke.
-                 *
-                 * The value of the entry in the map are changed as data is read for that partition
-                 * but the keyset should be changed only from listener.
-                 *
-                 */
-                consumer.commitAsync();
-                //consumer.assignment().
-            }
+            consumer.commitSync(tpOffsetMd);
+//            for (ConsumerRecord rec: records) {
+//                System.out.printf("offset = %d, key = %s, value = %s\n", rec.offset(), rec.key(), rec.value());
+//                // commit offset
+//                recordsCount++;
+//                /**
+//                 * a map of topicPartition, and a ds for offset of all 'ids' in all the records for a partition
+//                 * Given that there are a limited number of ids, a particular id is handled by a dedicated tp.
+//                 * That map is populated in the listener#onAssign, and the revoked entries are flushed on onRevoke.
+//                 *
+//                 * The value of the entry in the map are changed as data is read for that partition
+//                 * but the keyset should be changed only from listener.
+//                 *
+//                 */
+//
+//                consumer.commitAsync();
+//                //consumer.assignment().
+//            }
+            LOG.severe("Records consumed = " + recordsCount);
             System.out.println(recordsCount + " records consumed.");
         }
     }
+
+    //TODO Refactor value to have more data, such as min/max offset, etc
+    private static Map<Integer, BlockingQueue<ConsumerRecord<String, SRecord>>> customerQueueM = new ConcurrentHashMap<>();
+
+    private static final int TIMEOUT_MS = 30_000;
+    private static OffsetAndMetadata processPartitionRecords(List<ConsumerRecord<String, SRecord>> records) {
+        // create customer level q.
+        LOG.severe("Processing " + records.size() + " data from a partition");
+        for (ConsumerRecord<String, SRecord> rec: records) {
+            if(customerQueueM.containsKey(rec.value().getId())) {
+                customerQueueM.get(rec.value().getId()).add(rec);
+            } else {
+                BlockingQueue<ConsumerRecord<String, SRecord>> customerQ = new LinkedBlockingQueue<>();
+                customerQ.add(rec);
+                customerQueueM.put(rec.value().getId(), customerQ);
+            }
+        }
+        LOG.severe("Consumer queue size=" + customerQueueM.size());
+
+        //Map<Integer, CompletableFuture<CustomerOffset>> customerFutures = new HashMap<>();
+        List<CompletableFuture<CustomerOffset>> customerFutures = new LinkedList<>();
+        customerQueueM.forEach((a, b) -> {
+            // create ConsumerRecords
+            final List<ConsumerRecord<String, SRecord>> recs = new LinkedList<>();
+            b.drainTo(recs);
+            final CustomerIdRecords customerIdRecords = new CustomerIdRecords(a, recs);
+            CompletableFuture<CustomerOffset> custFuture = ProcessingPool.processRecordsPerPartition(customerIdRecords);
+            customerFutures.add(custFuture);
+        });
+        FutureUtils.waitForFutures(customerFutures, TIMEOUT_MS);
+        // scan future results, and create a offset datastructure.
+        List<CustomerOffset> processedOffsets = new LinkedList<>();
+        customerFutures.forEach((a) -> {
+            // All futures are completed; the ones with exceptions are returning the min offset from the batch.
+            processedOffsets.add(FutureUtils.getValueForCompletedCfAndSwallowAnyException(a, 2_000));
+        });
+        LOG.info("processedOffsets:" + processedOffsets);
+        LOG.severe("processedOffsets=" + processedOffsets);
+        // a ds to represent the combined offset map. Populate it and commit with it.
+        final CommitOffsetAndMetadata offsetAndMd = CommitOffsetAndMetadata.fromCustomerOffsets(processedOffsets);
+        // commit
+        final OffsetAndMetadata ofmd = new OffsetAndMetadata(offsetAndMd.getOffset(), offsetAndMd.offsetMdString());
+        LOG.info("OffsetAndMD=" + ofmd);
+        return ofmd;
+    }
+
 
     // helper method to convert string values to SRecords.
     private static List<ConsumerRecord<String, SRecord>> fromString(List<ConsumerRecord<String, String>> vals) {
@@ -68,8 +121,9 @@ public class SConsumer1 {
     private static Properties initProps() {
         final Properties props = new Properties();
         props.put("bootstrap.servers", "localhost:9091");
-        props.put("group.id", "test1");
+        props.put("group.id", CommonConfiguration.GROUP_ID);
         //props.put("enable.auto.commit", "true");
+        props.setProperty("enable.auto.commit", "false");
         //props.put("auto.commit.interval.ms", "1000");
         props.put("session.timeout.ms", "30000");
         props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
@@ -103,51 +157,3 @@ public class SConsumer1 {
         }
     }
 }
-
-/**
- * import java.util.Properties;
- * import java.util.Arrays;
- * import org.apache.kafka.clients.consumer.KafkaConsumer;
- * import org.apache.kafka.clients.consumer.ConsumerRecords;
- * import org.apache.kafka.clients.consumer.ConsumerRecord;
- *
- * public class SimpleConsumer {
- *    public static void main(String[] args) throws Exception {
- *       if(args.length == 0){
- *          System.out.println("Enter topic name");
- *          return;
- *       }
- *       //Kafka consumer configuration settings
- *       String topicName = args[0].toString();
- *       Properties props = new Properties();
- *
- *       props.put("bootstrap.servers", "localhost:9092");
- *       props.put("group.id", "test");
- *       props.put("enable.auto.commit", "true");
- *       props.put("auto.commit.interval.ms", "1000");
- *       props.put("session.timeout.ms", "30000");
- *       props.put("key.deserializer",
- *          "org.apache.kafka.common.serializa-tion.StringDeserializer");
- *       props.put("value.deserializer",
- *          "org.apache.kafka.common.serializa-tion.StringDeserializer");
- *       KafkaConsumer<String, String> consumer = new KafkaConsumer
- *          <String, String>(props);
- *
- *       //Kafka Consumer subscribes list of topics here.
- *       consumer.subscribe(Arrays.asList(topicName))
- *
- *       //print the topic name
- *       System.out.println("Subscribed to topic " + topicName);
- *       int i = 0;
- *
- *       while (true) {
- *          ConsumerRecords<String, String> records = con-sumer.poll(100);
- *          for (ConsumerRecord<String, String> record : records)
- *
- *          // print the offset,key and value for the consumer records.
- *          System.out.printf("offset = %d, key = %s, value = %s\n",
- *             record.offset(), record.key(), record.value());
- *       }
- *    }
- * }
- */
