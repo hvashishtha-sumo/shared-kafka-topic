@@ -25,33 +25,16 @@ public class SConsumer1 {
         // consume records
         while (true) {
             ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1_000));
-//            consumer.committed()
             final Map<TopicPartition, OffsetAndMetadata> tpOffsetMd = new HashMap<>();
             for (TopicPartition tp: records.partitions()) {
                 List<ConsumerRecord<String, String>> perPartitionRecords = records.records(tp);
                 //re-create the record from values.
+                Map<TopicPartition, OffsetAndMetadata> currentOffsetAndMd = consumer.committed(Collections.singleton(tp));
                 List<ConsumerRecord<String, SRecord>> perPartitionData = fromString(perPartitionRecords);
-                tpOffsetMd.put(tp, processPartitionRecords(perPartitionData));
+                tpOffsetMd.put(tp, processPartitionRecords(perPartitionData, currentOffsetAndMd.get(tp)));
                 recordsCount += perPartitionData.size();
             }
             consumer.commitSync(tpOffsetMd);
-//            for (ConsumerRecord rec: records) {
-//                System.out.printf("offset = %d, key = %s, value = %s\n", rec.offset(), rec.key(), rec.value());
-//                // commit offset
-//                recordsCount++;
-//                /**
-//                 * a map of topicPartition, and a ds for offset of all 'ids' in all the records for a partition
-//                 * Given that there are a limited number of ids, a particular id is handled by a dedicated tp.
-//                 * That map is populated in the listener#onAssign, and the revoked entries are flushed on onRevoke.
-//                 *
-//                 * The value of the entry in the map are changed as data is read for that partition
-//                 * but the keyset should be changed only from listener.
-//                 *
-//                 */
-//
-//                consumer.commitAsync();
-//                //consumer.assignment().
-//            }
             LOG.severe("Records consumed = " + recordsCount);
             System.out.println(recordsCount + " records consumed.");
         }
@@ -61,10 +44,11 @@ public class SConsumer1 {
     private static Map<Integer, BlockingQueue<ConsumerRecord<String, SRecord>>> customerQueueM = new ConcurrentHashMap<>();
 
     private static final int TIMEOUT_MS = 30_000;
-    private static OffsetAndMetadata processPartitionRecords(List<ConsumerRecord<String, SRecord>> records) {
+    private static OffsetAndMetadata processPartitionRecords(List<ConsumerRecord<String, SRecord>> partitionRecords,
+                                                             final OffsetAndMetadata currentCommittedOffsetAndMd) {
         // create customer level q.
-        LOG.severe("Processing " + records.size() + " data from a partition");
-        for (ConsumerRecord<String, SRecord> rec: records) {
+        LOG.severe("Processing " + partitionRecords.size() + " data from a partition");
+        for (ConsumerRecord<String, SRecord> rec: partitionRecords) {
             if(customerQueueM.containsKey(rec.value().getId())) {
                 customerQueueM.get(rec.value().getId()).add(rec);
             } else {
@@ -77,13 +61,31 @@ public class SConsumer1 {
 
         //Map<Integer, CompletableFuture<CustomerOffset>> customerFutures = new HashMap<>();
         List<CompletableFuture<CustomerOffset>> customerFutures = new LinkedList<>();
+        final CommitOffsetAndMetadata commitOffsetAndMetadata = CommitOffsetAndMetadata.fromOffsetAndMetadata(currentCommittedOffsetAndMd);
+        // filter out the data that has already been processed.
         customerQueueM.forEach((a, b) -> {
             // create ConsumerRecords
             final List<ConsumerRecord<String, SRecord>> recs = new LinkedList<>();
-            b.drainTo(recs);
-            final CustomerIdRecords customerIdRecords = new CustomerIdRecords(a, recs);
-            CompletableFuture<CustomerOffset> custFuture = ProcessingPool.processRecordsPerPartition(customerIdRecords);
-            customerFutures.add(custFuture);
+            final long currentCommittedOffset = commitOffsetAndMetadata.offsetForCustomer(a);
+            if (currentCommittedOffset > 0) {
+                // there is some offset from the previous commit, check and ignore already processed records
+                while (b.peek() != null && b.peek().offset() <= currentCommittedOffset) {
+                    ConsumerRecord<String, SRecord> curRecord = b.remove();
+                    LOG.info("Skipping processing record for customer " + a + " currentCommittedOffset=" +
+                            currentCommittedOffset + ", readRecordOffset=" + curRecord.offset());
+                }
+            }
+            if (b.peek() != null) {
+                LOG.info("Start to process records for customer " + a + " from offset " + b.peek().offset());
+                // drain remaining elems in the list for processing
+                b.drainTo(recs);
+                final CustomerIdRecords customerIdRecords = new CustomerIdRecords(a, recs);
+                CompletableFuture<CustomerOffset> custFuture = ProcessingPool.processRecordsPerPartition(customerIdRecords);
+                customerFutures.add(custFuture);
+            } else {
+                //TODO: Can't remove the old md as one need to keep it up. BUG-XXX
+                LOG.severe("No more elements to process for the customer " + a);
+            }
         });
         FutureUtils.waitForFutures(customerFutures, TIMEOUT_MS);
         // scan future results, and create a offset datastructure.
@@ -95,9 +97,15 @@ public class SConsumer1 {
         LOG.info("processedOffsets:" + processedOffsets);
         LOG.severe("processedOffsets=" + processedOffsets);
         // a ds to represent the combined offset map. Populate it and commit with it.
+        // update the commitOffsetAndMD with the new batch updates
+        LOG.info("Old commitOffsetAndMd=" + commitOffsetAndMetadata);
         final CommitOffsetAndMetadata offsetAndMd = CommitOffsetAndMetadata.fromCustomerOffsets(processedOffsets);
+        LOG.info("New batch commitOffsetAndMd=" + offsetAndMd);
+        // merge old and new ofmd.
+        processedOffsets.forEach(a -> commitOffsetAndMetadata.updateOrAddCustomerOffset(a));
+        LOG.info("Merged commitOffsetAndMd=" + commitOffsetAndMetadata);
         // commit
-        final OffsetAndMetadata ofmd = new OffsetAndMetadata(offsetAndMd.getOffset(), offsetAndMd.offsetMdString());
+        final OffsetAndMetadata ofmd = new OffsetAndMetadata(commitOffsetAndMetadata.getOffset(), commitOffsetAndMetadata.offsetMdString());
         LOG.info("OffsetAndMD=" + ofmd);
         return ofmd;
     }
