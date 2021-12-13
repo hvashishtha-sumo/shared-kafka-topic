@@ -15,7 +15,7 @@ public class SConsumer1 {
         consumeRecords();
     }
     private static void consumeRecords() {
-        String topic = "test2";
+        String topic = CommonConfiguration.topic;
         final Properties p = initProps();
         KafkaConsumer<String, String> consumer = new KafkaConsumer<>(p);
         final ConsumerRebalanceListener listener = new PartitionListener(consumer);
@@ -24,7 +24,7 @@ public class SConsumer1 {
         int recordsCount = 0;
         // consume records
         while (true) {
-            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1_000));
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(3_000));
             final Map<TopicPartition, OffsetAndMetadata> tpOffsetMd = new HashMap<>();
             for (TopicPartition tp: records.partitions()) {
                 List<ConsumerRecord<String, String>> perPartitionRecords = records.records(tp);
@@ -35,8 +35,7 @@ public class SConsumer1 {
                 recordsCount += perPartitionData.size();
             }
             consumer.commitSync(tpOffsetMd);
-            LOG.severe("Records consumed = " + recordsCount);
-            System.out.println(recordsCount + " records consumed.");
+            LOG.info("Records consumed = " + recordsCount);
         }
     }
 
@@ -47,7 +46,7 @@ public class SConsumer1 {
     private static OffsetAndMetadata processPartitionRecords(List<ConsumerRecord<String, SRecord>> partitionRecords,
                                                              final OffsetAndMetadata currentCommittedOffsetAndMd) {
         // create customer level q.
-        LOG.severe("Processing " + partitionRecords.size() + " data from a partition");
+        LOG.info("Processing " + partitionRecords.size() + " data from a partition");
         for (ConsumerRecord<String, SRecord> rec: partitionRecords) {
             if(customerQueueM.containsKey(rec.value().getId())) {
                 customerQueueM.get(rec.value().getId()).add(rec);
@@ -60,19 +59,21 @@ public class SConsumer1 {
         LOG.severe("Consumer queue size=" + customerQueueM.size());
 
         //Map<Integer, CompletableFuture<CustomerOffset>> customerFutures = new HashMap<>();
-        List<CompletableFuture<CustomerOffset>> customerFutures = new LinkedList<>();
-        final CommitOffsetAndMetadata commitOffsetAndMetadata = CommitOffsetAndMetadata.fromOffsetAndMetadata(currentCommittedOffsetAndMd);
+        List<CompletableFuture<CustomerBatchResult>> customerFutures = new LinkedList<>();
+        final CommitOffsetAndMetadata previousCommittedOffsetAndMetadata = CommitOffsetAndMetadata.fromOffsetAndMetadata(currentCommittedOffsetAndMd);
         // filter out the data that has already been processed.
         customerQueueM.forEach((a, b) -> {
             // create ConsumerRecords
             final List<ConsumerRecord<String, SRecord>> recs = new LinkedList<>();
-            final long currentCommittedOffset = commitOffsetAndMetadata.offsetForCustomer(a);
-            if (currentCommittedOffset > 0) {
-                // there is some offset from the previous commit, check and ignore already processed records
-                while (b.peek() != null && b.peek().offset() <= currentCommittedOffset) {
-                    ConsumerRecord<String, SRecord> curRecord = b.remove();
-                    LOG.info("Skipping processing record for customer " + a + " currentCommittedOffset=" +
-                            currentCommittedOffset + ", readRecordOffset=" + curRecord.offset());
+            if (previousCommittedOffsetAndMetadata != null) {
+                final long currentCommittedOffset = previousCommittedOffsetAndMetadata.offsetForCustomer(a);
+                if (currentCommittedOffset > 0) {
+                    // there is some offset from the previous commit, check and ignore already processed records
+                    while (b.peek() != null && b.peek().offset() <= currentCommittedOffset) {
+                        ConsumerRecord<String, SRecord> curRecord = b.remove();
+                        LOG.info("Skipping processing record for customer " + a + " currentCommittedOffset=" +
+                                currentCommittedOffset + ", readRecordOffset=" + curRecord.offset());
+                    }
                 }
             }
             if (b.peek() != null) {
@@ -80,11 +81,11 @@ public class SConsumer1 {
                 // drain remaining elems in the list for processing
                 b.drainTo(recs);
                 final CustomerIdRecords customerIdRecords = new CustomerIdRecords(a, recs);
-                CompletableFuture<CustomerOffset> custFuture = ProcessingPool.processRecordsPerPartition(customerIdRecords);
+                CompletableFuture<CustomerBatchResult> custFuture = ProcessingPool.processRecordsPerPartition(customerIdRecords);
                 customerFutures.add(custFuture);
             } else {
                 //TODO: Can't remove the old md as one need to keep it up. BUG-XXX
-                LOG.severe("No more elements to process for the customer " + a);
+                LOG.severe("No elements to process for the customer " + a);
             }
         });
         FutureUtils.waitForFutures(customerFutures, TIMEOUT_MS);
@@ -92,24 +93,30 @@ public class SConsumer1 {
         List<CustomerOffset> processedOffsets = new LinkedList<>();
         customerFutures.forEach((a) -> {
             // All futures are completed; the ones with exceptions are returning the min offset from the batch.
-            processedOffsets.add(FutureUtils.getValueForCompletedCfAndSwallowAnyException(a, 2_000));
+            CustomerBatchResult result = FutureUtils.getValueForCompletedCfAndSwallowAnyException(a, 2_000);
+            processedOffsets.add(result.offset());
         });
         LOG.info("processedOffsets:" + processedOffsets);
-        LOG.severe("processedOffsets=" + processedOffsets);
         // a ds to represent the combined offset map. Populate it and commit with it.
         // update the commitOffsetAndMD with the new batch updates
-        LOG.info("Old commitOffsetAndMd=" + commitOffsetAndMetadata);
-        final CommitOffsetAndMetadata offsetAndMd = CommitOffsetAndMetadata.fromCustomerOffsets(processedOffsets);
-        LOG.info("New batch commitOffsetAndMd=" + offsetAndMd);
+        LOG.info("Old commitOffsetAndMd=" + previousCommittedOffsetAndMetadata);
+
+        final CommitOffsetAndMetadata offsetAndMdForThisBatch = CommitOffsetAndMetadata.fromCustomerOffsets(processedOffsets);
+        LOG.info("New batch commitOffsetAndMd=" + offsetAndMdForThisBatch);
         // merge old and new ofmd.
-        processedOffsets.forEach(a -> commitOffsetAndMetadata.updateOrAddCustomerOffset(a));
-        LOG.info("Merged commitOffsetAndMd=" + commitOffsetAndMetadata);
+        final CommitOffsetAndMetadata merged = CommitOffsetAndMetadata.merge(offsetAndMdForThisBatch, previousCommittedOffsetAndMetadata);
+//        if (previousCommittedOffsetAndMetadata != null) {
+//            processedOffsets.forEach(a -> previousCommittedOffsetAndMetadata.updateOrAddCustomerOffset(a));
+//            merged = previousCommittedOffsetAndMetadata;
+//        } else {
+//            merged = offsetAndMdForThisBatch;
+//        }
+        LOG.info("Merged commitOffsetAndMd=" + merged);
         // commit
-        final OffsetAndMetadata ofmd = new OffsetAndMetadata(commitOffsetAndMetadata.getOffset(), commitOffsetAndMetadata.offsetMdString());
+        final OffsetAndMetadata ofmd = new OffsetAndMetadata(merged.getOffset(), merged.offsetMdString());
         LOG.info("OffsetAndMD=" + ofmd);
         return ofmd;
     }
-
 
     // helper method to convert string values to SRecords.
     private static List<ConsumerRecord<String, SRecord>> fromString(List<ConsumerRecord<String, String>> vals) {
@@ -156,10 +163,10 @@ public class SConsumer1 {
             final Map<TopicPartition, OffsetAndMetadata> offsetAndMetadataMap = consumer.committed(collection.stream().collect(Collectors.toSet()));
             offsetAndMetadataMap.forEach((a, b) -> {
                 if (b != null) {
-                    System.out.println(a + ", offset=" + b.offset() + ", metadata=" + b.metadata());
+                    LOG.info("Assigned topic " + a + ", offset=" + b.offset() + ", metadata=" + b.metadata());
                     consumer.seek(a, b.offset());
                 } else {
-                    System.out.println(a + ", and Null offset");
+                    LOG.info("Assigned topic " + a + ", with Null offset");
                 }
             });
         }

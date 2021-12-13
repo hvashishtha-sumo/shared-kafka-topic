@@ -15,7 +15,7 @@ public class SConsumer {
         consumeRecords();
     }
     private static void consumeRecords() {
-        String topic = "t1";
+        String topic = "test1";
         final Properties p = initProps();
         KafkaConsumer<String, String> consumer = new KafkaConsumer<>(p);
         final ConsumerRebalanceListener listener = new PartitionListener(consumer);

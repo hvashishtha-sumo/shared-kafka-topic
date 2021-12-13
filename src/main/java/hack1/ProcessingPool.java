@@ -21,12 +21,12 @@ public class ProcessingPool {
     // on completion, it 'updates' that it is complete... in offset manager.
     //
 
-    public static CompletableFuture<CustomerOffset> processRecordsPerPartition(final CustomerIdRecords customerIdRecords) {
-        CompletableFuture<CustomerOffset> perCustomerCallable = createCustomerBatchCf(customerIdRecords);
+    public static CompletableFuture<CustomerBatchResult> processRecordsPerPartition(final CustomerIdRecords customerIdRecords) {
+        CompletableFuture<CustomerBatchResult> perCustomerCallable = createCustomerBatchCf(customerIdRecords);
         return perCustomerCallable;
     }
 
-    private static CompletableFuture<CustomerOffset> createCustomerBatchCf(final CustomerIdRecords customerIdRecords) {
+    private static CompletableFuture<CustomerBatchResult> createCustomerBatchCf(final CustomerIdRecords customerIdRecords) {
         // peek items from the customer.
     // TODO Make a max size/batch        final int maxRecPerTask = 10;
         if (customerIdRecords.recordsSize() > 0) {
@@ -34,27 +34,26 @@ public class ProcessingPool {
             return processBatch(customerIdRecords);
         } else {
             System.out.println("No element for cid " + customerIdRecords.cid());
-            CompletableFuture<CustomerOffset> f = new CompletableFuture<>();
+            CompletableFuture<CustomerBatchResult> f = new CompletableFuture<>();
             f.completeExceptionally(new IllegalArgumentException("No element found for customerId " + customerIdRecords.cid()));
             return f;
         }
     }
 
-     private static CompletableFuture<CustomerOffset> processBatch(CustomerIdRecords batch) {
+     private static CompletableFuture<CustomerBatchResult> processBatch(CustomerIdRecords batch) {
         //final CompletableFuture<Void> f = new CompletableFuture<>();
-        final CompletableFuture<CustomerOffset> f = new CompletableFuture<>();
+        final CompletableFuture<CustomerBatchResult> f = new CompletableFuture<>();
             switch (batch.cid()) {
                 case 1: {
                     printBatch(batch);
                     //f.completeExceptionally(new IllegalStateException("LOONG Computation Exception"));
-                    LOG.severe("Processing records for customer 1");
-                    f.complete(new CustomerOffset(batch.cid(), batch.minOffset()));
+                    LOG.severe("Processing failed for customer 1");
+                    f.complete(new CustomerBatchResult(batch, false));
                     break;
                 }
                 default:
                     printBatch(batch);
-                    f.complete(new CustomerOffset(batch.cid(), batch.maxOffset()));
-//                    f.complete(null);
+                    f.complete(new CustomerBatchResult(batch, true));
                     System.out.println("Processing completed for batch with id=" + batch.cid());
             }
             return f;
